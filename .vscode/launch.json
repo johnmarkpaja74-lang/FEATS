@@ -1,0 +1,29 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "node",
+            "request": "launch",
+            "name": "Start FEATS shared server",
+            "program": "${workspaceFolder}/start.cjs",
+            "cwd": "${workspaceFolder}",
+            "console": "internalConsole",
+            "serverReadyAction": {
+                "pattern": "FEATS shared server: (https?://\\S+)",
+                "uriFormat": "%s",
+                "action": "debugWithChrome",
+                "webRoot": "${workspaceFolder}"
+            },
+            "skipFiles": [
+                "<node_internals>/**"
+            ]
+        },
+        {
+            "type": "chrome",
+            "request": "launch",
+            "name": "Open FEATS (server already running)",
+            "url": "http://localhost:3000",
+            "webRoot": "${workspaceFolder}"
+        }
+    ]
+}

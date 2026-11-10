@@ -1,0 +1,177 @@
+﻿'use strict';
+const {createServer}=require('../server.cjs');
+const assert=require('node:assert/strict');
+const fs=require('node:fs');
+const os=require('node:os');
+const path=require('node:path');
+const {DatabaseSync}=require('node:sqlite');
+const dataDir=fs.mkdtempSync(path.join(os.tmpdir(),'feats-server-test-'));
+let server,base;
+const options={dataDir};
+const proof='data:image/png;base64,'+fs.readFileSync(path.join(__dirname,'../assets/payments/gcash.png')).toString('base64');
+const officerCode='MY-OFFICER-01',adminCode='MY-ADVISER-01';
+async function start(){server=createServer(options);await new Promise(r=>server.listen(0,'127.0.0.1',r));base='http://127.0.0.1:'+server.address().port;}
+function client(){let cookie='';const request=async function request(route,body,expected=200){const res=await fetch(base+'/api/'+route,{method:body===undefined?'GET':'POST',headers:{Cookie:cookie,Origin:base,...(body===undefined?{}:{'Content-Type':'application/json'})},body:body===undefined?undefined:JSON.stringify(body)});if(res.headers.get('set-cookie'))cookie=res.headers.get('set-cookie').split(';')[0];const data=await res.json();assert.equal(res.status,expected,route+': '+(data.error||''));return data;};request.get=route=>fetch(base+route,{headers:{Cookie:cookie}});return request;}
+(async()=>{try{
+ await start();const student=client(),other=client(),officer=client(),admin=client(),guest=client();
+ await guest('workspace',undefined,401);
+ await guest('signup',{name:'Fake staff',email:'fake@example.test',password:'Password123',role:'officer'},400);
+ for(const role of ['officer','admin'])for(const staffCode of ['abc','contains spaces','!bad','x'.repeat(33)]){
+  await guest('signup',{name:'Invalid code',email:'invalid@example.test',password:'Password123',role,staffCode},400);
+ }
+ for(const course of [undefined,null,'','Other','bitm',' BITM '])await guest('signup',{name:'Invalid course',email:'invalid-course@example.test',password:'Password123',schoolId:'2022-5000',role:'student',course},400);
+ const a=await student('signup',{name:'Student One',email:'one@example.test',password:'Password123',schoolId:'2021 - 3090',role:'student',course:'BITM',section:'A',year:'1st Year'},201);
+ const b=await other('signup',{name:'Student Two',email:'two@example.test',password:'Password123',schoolId:'2022-4000',role:'student',course:'BSCE'},201);
+ for(const [i,course] of ['BSIT','BSMRS'].entries())assert.equal((await client()('signup',{name:'Course Student '+i,email:'course-'+i+'@example.test',password:'Password123',schoolId:'2022-500'+i,role:'student',course},201)).user.course,course);
+ await admin('signup',{name:'Adviser',email:'admin@example.test',password:'Password123',role:'admin',staffCode:adminCode,setupCode:JSON.parse(fs.readFileSync(path.join(dataDir,'admin-setup.json'),'utf8')).code},201);
+ const pendingOfficer=await officer('signup',{name:'Collector',email:'officer@example.test',password:'Password123',role:'officer',staffCode:officerCode.toLowerCase()},201);
+ assert.equal(pendingOfficer.user.status,'pending');
+ await admin('actions',{type:'accountStatus',payload:{id:pendingOfficer.user.id,status:'active'}});
+ await officer('login',{identifier:officerCode,password:'Password123',role:'officer'});
+ assert.equal(a.user.schoolId,'2021-3090');assert.equal(a.user.section,'A');assert.equal(a.user.year,'1st Year');assert.equal(a.user.password,undefined);assert.equal(a.user.course,'BITM');assert.equal(b.user.course,'BSCE');
+ assert.equal((await officer('session')).user.staffCode,officerCode);
+ await guest('signup',{name:'Duplicate code',email:'duplicate@example.test',password:'Password123',role:'admin',staffCode:officerCode.toLowerCase()},409);
+ await guest('signup',{name:'Duplicate ID',email:'collision@example.test',password:'Password123',role:'officer',staffCode:'2021-3090'},409);
+ await guest('signup',{name:'Missing password',email:'nopassword@example.test',role:'officer',staffCode:'MY-NEW-CODE'},400);
+ await officer('logout',{});
+ await officer('login',{identifier:officerCode.toLowerCase(),password:'WrongPassword',role:'officer'},401);
+ await officer('login',{identifier:officerCode,password:'Password123',role:'admin'},403);
+ await officer('login',{identifier:' '+officerCode.toLowerCase()+' ',password:'Password123',role:'officer'});
+ await admin('logout',{});await admin('login',{identifier:adminCode.toLowerCase(),password:'Password123',role:'admin'});
+ await guest('signup',{name:'Second Collector',email:'collector-two@example.test',password:'Password123',role:'officer',staffCode:'MY-OFFICER-02'},201);
+
+ // Load records written by the earlier version, using only this test's temporary database.
+ await new Promise(r=>server.close(r));
+ const legacyDb=new DatabaseSync(path.join(dataDir,'feats.sqlite'));
+ const legacy=JSON.parse(legacyDb.prepare('SELECT json FROM workspace WHERE id=1').get().json);
+ delete legacy.users.find(u=>u.id===b.user.id).course;delete legacy.users.find(u=>u.id===b.user.id).attendanceToken;legacy.events[0].capacity=1;
+ const bankHistory={id:'legacy-bank-payment',studentId:a.user.id,feeId:'legacy-fee',feeName:'Past fee',amount:75,method:'Bank transfer',destination:{enabled:true,name:'Past treasury',account:'HISTORIC-ACCOUNT'},externalReference:'PAST-TRANSFER',reference:'FEATS-PAST',status:'Paid',createdAt:'2025-01-01T00:00:00.000Z'};
+ legacy.payments.push(bankHistory);legacy.paymentChannels['Bank transfer']={enabled:true,name:'Past treasury',account:'HISTORIC-ACCOUNT'};
+ legacyDb.prepare('UPDATE workspace SET json=? WHERE id=1').run(JSON.stringify(legacy));legacyDb.close();await start();
+ const legacyWorkspace=await other('workspace');assert.equal(legacyWorkspace.user.course,undefined,'Legacy students keep an unset course');assert.equal(legacyWorkspace.events[0].capacity,undefined);
+ assert.equal((await student('workspace')).paymentChannels['Bank transfer'],undefined);assert.deepEqual((await student('workspace')).payments.find(p=>p.id===bankHistory.id),bankHistory);
+ for(const account of [officer,admin])await account('actions',{type:'updateCourse',payload:{course:'BSIT'}},403);
+ await client()('actions',{type:'updateCourse',payload:{course:'BSIT'}},401);
+ for(const course of [undefined,'BSCS','bitm'])await student('actions',{type:'updateCourse',payload:{course}},400);
+ const profile=await student('actions',{type:'updateCourse',payload:{course:'BSMRS',studentId:b.user.id,id:b.user.id}});
+ assert.equal(profile.workspace.user.course,'BSMRS');assert.equal(profile.result.id,a.user.id);assert.equal((await other('session')).user.course,undefined,'Students cannot target another profile');
+ await other('actions',{type:'updateCourse',payload:{course:'BSCE'}});assert.equal((await other('session')).user.course,'BSCE');
+ await student('actions',{type:'updateCourse',payload:{course:'BITM',section:'B-2',year:'2nd Year'}});assert.equal((await student('session')).user.section,'B-2');assert.equal((await student('session')).user.year,'2nd Year');
+ for(const payload of [{course:'BITM',year:'6th Year'},{course:'BITM',section:'bad/section'}])await student('actions',{type:'updateCourse',payload},400);
+ await student('actions',{type:'updateCourse',payload:{course:'BITM',section:'A',year:'1st Year'}});
+ const originalEventId=legacy.events[0].id;
+ await student('actions',{type:'register',payload:{eventId:originalEventId}});await other('actions',{type:'register',payload:{eventId:originalEventId}});
+ assert.equal((await officer('workspace')).events.find(e=>e.id===originalEventId).registrationCount,2,'Legacy capacity does not limit registration');
+
+ const assigned=await officer('actions',{type:'saveFee',payload:{name:'Shared membership',amount:350.25,dueDate:'2026-12-01',studentIds:[a.user.id]}});
+ const feeId=assigned.workspace.fees[0].id;
+ const mine=await student('workspace');assert.equal(mine.fees.length,1);assert.equal(mine.users.some(u=>u.id===b.user.id),false);assert.equal((await other('workspace')).fees.length,0);
+ await other('actions',{type:'createPayment',payload:{feeId,method:'GCash',requestOnly:true}},403);
+ await student('actions',{type:'saveFee',payload:{name:'hack',amount:1,dueDate:'2026-12-01',studentIds:[a.user.id]}},403);
+ await admin('actions',{type:'saveChannels',payload:{channels:{}}},403);
+ await student('actions',{type:'createPayment',userId:b.user.id,payload:{feeId,method:'GCash',requestOnly:true}},409);
+ await student('actions',{type:'createPayment',payload:{feeId,method:'Bank transfer',requestOnly:true}},400);
+ await officer('actions',{type:'saveChannels',payload:{channels:{GCash:{enabled:true,name:'Organization Treasury',account:'TEST-ACCOUNT',instructions:'Use your ticket reference'},'Bank transfer':{enabled:true,name:'Removed channel',account:'NOT-AVAILABLE'}}}});
+ await officer('actions',{type:'saveChannels',payload:{channels:{GCash:{enabled:true,name:'',account:'TEST-ACCOUNT'},Maya:{enabled:true,name:'Maya account',account:''}}}},400);
+ assert.equal((await student('workspace')).paymentChannels.GCash.account,'TEST-ACCOUNT');
+ assert.equal((await student('workspace')).paymentChannels['Bank transfer'],undefined);
+ const ticket=await student('actions',{type:'createPayment',payload:{feeId,amount:1,studentId:b.user.id,method:'GCash',requestOnly:true}});
+ const payId=ticket.result.id;assert.equal(ticket.result.amount,350.25);assert.equal(ticket.result.studentId,a.user.id);
+ assert.equal(ticket.result.destination.account,'TEST-ACCOUNT');
+ await officer('actions',{type:'saveChannels',payload:{channels:{GCash:{enabled:true,name:'Organization Treasury',account:'NEW-TEST-ACCOUNT'}}}});
+ assert.equal((await student('workspace')).payments[0].destination.account,'TEST-ACCOUNT','Existing tickets retain receiving instructions');
+ await student('actions',{type:'createPayment',payload:{feeId,method:'GCash',requestOnly:true}},409);
+ await officer('actions',{type:'verifyPayment',payload:{id:payId,status:'Paid',note:'Premature'}},409);
+ await other('actions',{type:'submitPayment',payload:{id:payId,method:'GCash',externalReference:'fake'}},403);
+ await student('actions',{type:'submitPayment',payload:{id:payId,method:'Bank transfer',externalReference:'REMOVED-METHOD'}},400);
+ for(const proofImage of [undefined,'','/assets/payments/gcash.png','data:image/svg+xml;base64,PHN2Zz4=','data:image/png;base64,PHN2Zz4='])await student('actions',{type:'submitPayment',payload:{id:payId,method:'GCash',proofImage}},400);
+ await student('actions',{type:'submitPayment',payload:{id:payId,method:'GCash',externalReference:'TEST-TRANSFER',proofImage:proof}});
+ assert.equal((await student('workspace')).payments[0].status,'Pending','An attached screenshot does not auto-verify payment');
+ assert.equal((await student('workspace')).payments[0].hasProof,true);
+ assert.equal((await student('workspace')).payments[0].proofImage,undefined,'Workspaces do not embed proof image data');
+ const proofUrl='/api/payments/'+payId+'/proof';
+ for(const account of [student,officer,admin]){const response=await account.get(proofUrl);assert.equal(response.status,200);assert.equal(response.headers.get('content-type'),'image/png');assert.equal(response.headers.get('cache-control'),'no-store');assert.equal(Buffer.from(await response.arrayBuffer()).toString('base64'),proof.split(',')[1]);}
+ assert.equal((await other.get(proofUrl)).status,403);assert.equal((await fetch(base+proofUrl)).status,401);
+ await student('actions',{type:'verifyPayment',payload:{id:payId,status:'Paid',note:'Fake'}},403);
+ await officer('actions',{type:'verifyPayment',payload:{id:payId,status:'Paid',note:'Transfer checked'}});
+ const issuedReceipt=(await student('workspace')).payments.find(p=>p.id===payId).receipt;
+ assert.ok(issuedReceipt.number.startsWith('RCT-'));assert.equal(issuedReceipt.studentName,'Student One');assert.equal(issuedReceipt.schoolId,'2021-3090');assert.equal(issuedReceipt.course,'BITM');assert.equal(issuedReceipt.amount,350.25);assert.equal(issuedReceipt.officerName,'Collector');
+ assert.deepEqual((await admin('workspace')).payments.find(p=>p.id===payId).receipt,issuedReceipt);
+ await officer('actions',{type:'verifyPayment',payload:{id:payId,status:'Paid',note:'Duplicate'}},409);
+ await student('actions',{type:'updateCourse',payload:{course:'BSIT'}});assert.deepEqual((await student('workspace')).payments.find(p=>p.id===payId).receipt,issuedReceipt,'Issued receipt preserves the original identity and payment details');await student('actions',{type:'updateCourse',payload:{course:'BSMRS'}});
+
+ assert.equal((await student('workspace')).payments[0].status,'Paid');assert.equal((await admin('workspace')).payments[0].status,'Paid');assert.equal((await other('workspace')).payments.length,0);
+ // Direct screenshot submission and cash receipts have distinct requirements.
+ const proofFee=await officer('actions',{type:'saveFee',payload:{name:'Screenshot payment',amount:50,dueDate:'2026-12-01',studentIds:[a.user.id]}});
+ const proofFeeId=proofFee.workspace.fees.find(f=>f.name==='Screenshot payment').id;
+ await student('actions',{type:'createPayment',payload:{feeId:proofFeeId,method:'Maya'}},400);
+ const tooBig=Buffer.concat([Buffer.from([137,80,78,71,13,10,26,10]),Buffer.alloc(600*1024)]);
+ await student('actions',{type:'createPayment',payload:{feeId:proofFeeId,method:'Maya',proofImage:'data:image/png;base64,'+tooBig.toString('base64')}},400);
+ const direct=await student('actions',{type:'createPayment',payload:{feeId:proofFeeId,method:'Maya',proofImage:proof}});
+ assert.equal(direct.result.receipt,undefined);assert.equal(direct.result.status,'Pending');assert.equal(direct.result.hasProof,true);assert.equal(direct.result.externalReference,'');
+ await officer('actions',{type:'verifyPayment',payload:{id:direct.result.id,status:'Rejected',note:'Test rejection'}});assert.equal((await student('workspace')).payments.find(p=>p.id===direct.result.id).receipt,undefined);
+ await student('actions',{type:'createPayment',payload:{feeId:proofFeeId,method:'Cash'}},400);
+ const cash=await student('actions',{type:'createPayment',payload:{feeId:proofFeeId,method:'Cash',externalReference:'Cash received by collector'}});
+ assert.equal(cash.result.status,'Pending');assert.equal(cash.result.hasProof,undefined);
+ await officer('actions',{type:'verifyPayment',payload:{id:cash.result.id,status:'Paid',note:'Cash checked'}});
+ const eventDetails={title:'Shared Event',date:'2026-12-02',time:'09:00',venue:'Hall',description:'Test shared event',requirements:'ID',published:true};
+ const created=await officer('actions',{type:'saveEvent',payload:eventDetails});
+ const eventId=created.workspace.events.find(e=>e.title==='Shared Event').id;
+ assert.equal(created.workspace.events.find(e=>e.id===eventId).capacity,undefined);
+ for(const account of [student,admin])await account('actions',{type:'saveEvent',payload:{...eventDetails,coverImage:'/assets/events/campus.svg'}},403);
+ for(const coverImage of ['https://example.test/cover.png','/assets/events/other.svg','/data/private.svg','data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=','data:image/png;base64,PHN2Zz48L3N2Zz4=','data:image/jpeg;base64,iVBORw0KGgo=','data:image/png;base64,invalid!!',42])await officer('actions',{type:'saveEvent',payload:{...eventDetails,id:eventId,coverImage}},400);
+ for(const file of ['assembly','leadership','community','campus']){
+  const coverImage='/assets/events/'+file+'.svg';const saved=await officer('actions',{type:'saveEvent',payload:{...eventDetails,id:eventId,coverImage}});
+  assert.equal(saved.workspace.events.find(e=>e.id===eventId).coverImage,coverImage);
+ }
+ const png='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j6S8AAAAASUVORK5CYII=';
+ await officer('actions',{type:'saveEvent',payload:{...eventDetails,id:eventId,coverImage:png}});
+ const kept=await officer('actions',{type:'saveEvent',payload:{...eventDetails,id:eventId,title:'Shared Event edited',capacity:0}});
+ assert.equal(kept.workspace.events.find(e=>e.id===eventId).coverImage,png,'Editing without a replacement retains the cover');assert.equal(kept.workspace.events.find(e=>e.id===eventId).capacity,undefined);
+ const largeImage=Buffer.alloc(600*1024);Buffer.from([137,80,78,71,13,10,26,10]).copy(largeImage);
+ await officer('actions',{type:'saveEvent',payload:{...eventDetails,id:eventId,coverImage:'data:image/png;base64,'+largeImage.toString('base64')}});
+ await officer('actions',{type:'saveEvent',payload:{...eventDetails,id:eventId,coverImage:'data:image/png;base64,'+Buffer.concat([largeImage,Buffer.from([0])]).toString('base64')}},400);
+ await officer('actions',{type:'saveEvent',payload:{...eventDetails,id:eventId,coverImage:''}});
+ assert.equal((await student('workspace')).events.find(e=>e.id===eventId).coverImage,'');
+ await officer('actions',{type:'saveEvent',payload:{...eventDetails,id:eventId,coverImage:png}});
+ await student('actions',{type:'register',payload:{eventId}});
+ await student('actions',{type:'register',payload:{eventId}},409);
+ await other('actions',{type:'register',payload:{eventId}});
+ const opened=await officer('actions',{type:'toggleCheckIn',payload:{eventId}}),code=opened.workspace.events.find(e=>e.id===eventId).token;
+ const attended=await student('actions',{type:'checkIn',payload:{code,studentId:b.user.id}});assert.equal(attended.workspace.attendance[0].studentId,a.user.id);
+ await student('actions',{type:'checkIn',payload:{code}},409);assert.equal((await admin('workspace')).attendance.length,1);assert.equal((await other('workspace')).attendance.length,0);
+ const ownQr=(await student('session')).user.attendanceToken,otherQr=(await other('session')).user.attendanceToken;
+ assert.ok(ownQr);assert.notEqual(ownQr,otherQr);assert.equal((await officer('workspace')).users.some(u=>u.attendanceToken),false,'Student tokens are not exposed in staff rosters');
+ assert.equal((await other('workspace')).user.attendanceToken,otherQr);
+ for(const account of [student,admin])await account('student-qr',{token:otherQr},403);
+ const resolved=await officer('student-qr',{token:otherQr});assert.equal(resolved.student.schoolId,'2022-4000');assert.equal(resolved.student.attendanceToken,undefined);
+ await officer('student-qr',{token:'unknown'},404);
+ for(const account of [student,admin])await account('actions',{type:'checkInStudent',payload:{eventId,token:otherQr}},403);
+ await officer('actions',{type:'checkInStudent',payload:{eventId,token:'invalid'}},404);
+ await officer('actions',{type:'checkInStudent',payload:{eventId,token:ownQr}},409);
+ await officer('actions',{type:'toggleCheckIn',payload:{eventId}});
+ await officer('actions',{type:'checkInStudent',payload:{eventId,token:otherQr}},400);
+ await officer('actions',{type:'toggleCheckIn',payload:{eventId}});
+ await officer('actions',{type:'checkInStudent',payload:{eventId,token:otherQr}});
+ await officer('actions',{type:'checkInStudent',payload:{eventId,token:otherQr}},409);
+ assert.equal((await other('workspace')).attendance[0].studentId,b.user.id);
+ const unregistered=await officer('actions',{type:'saveEvent',payload:{...eventDetails,title:'Registration required'}});
+ const unregisteredId=unregistered.workspace.events.find(e=>e.title==='Registration required').id;
+ await officer('actions',{type:'toggleCheckIn',payload:{eventId:unregisteredId}});
+ await officer('actions',{type:'checkInStudent',payload:{eventId:unregisteredId,token:otherQr}},400);
+ const userData=JSON.stringify(await student('workspace'));assert.equal(userData.includes('scrypt'),false);assert.equal(userData.includes('"password"'),false);assert.equal(userData.includes('two@example.test'),false);
+ await student('logout',{});await student('workspace',undefined,401);await student('login',{identifier:'2021 - 3090',password:'Password123',role:'student'});
+ const badOrigin=await fetch(base+'/api/logout',{method:'POST',headers:{Origin:'https://attacker.test','Content-Type':'application/json'},body:'{}'});assert.equal(badOrigin.status,403);
+ for(const malformed of ['','{broken','[]','null']){const response=await fetch(base+'/api/logout',{method:'POST',headers:{Origin:base,'Content-Type':'application/json'},body:malformed});assert.equal(response.status,400,'Malformed JSON is rejected');}
+ const oversized=await fetch(base+'/api/actions',{method:'POST',headers:{Origin:base,'Content-Type':'application/json'},body:JSON.stringify({padding:'x'.repeat(1024*1024)})});assert.equal(oversized.status,413);
+ await new Promise(r=>server.close(r));await start();assert.equal((await student('workspace')).payments.find(p=>p.id===payId).status,'Paid','Sessions and records survive restart');
+ const persisted=await student('workspace');assert.deepEqual(persisted.payments.find(p=>p.id===payId).receipt,issuedReceipt,'Receipt survives restart');assert.equal(persisted.user.attendanceToken,ownQr,'Personal QR survives restart');assert.equal((await other('session')).user.attendanceToken,otherQr);assert.equal((await student.get(proofUrl)).status,200,'Payment screenshot survives restart');assert.equal(persisted.user.course,'BSMRS');assert.equal((await other('session')).user.course,'BSCE');assert.equal(persisted.events.find(e=>e.id===eventId).coverImage,png);assert.deepEqual(persisted.payments.find(p=>p.id===bankHistory.id),bankHistory,'Historical bank payments persist unchanged');
+ assert.equal((await student('health')).studentCourses,true);assert.equal((await student('health')).eventCovers,true);
+ await officer('logout',{});await officer('login',{identifier:officerCode,password:'Password123',role:'officer'});
+ assert.equal(fs.existsSync(path.join(dataDir,'setup-codes.json')),false,'Signup does not create generated access codes');
+ assert.equal((await fetch(base+'/data/setup-codes.json')).status,404);
+ assert.equal((await fetch(base+'/assets/events/not-allowed.svg')).status,404);assert.equal((await fetch(base+'/server.cjs')).status,404);
+ for(const file of ['assembly','leadership','community','campus']){const response=await fetch(base+'/assets/events/'+file+'.svg');assert.equal(response.status,200);assert.equal(response.headers.get('content-type'),'image/svg+xml');}
+ console.log('PASS: personal QR migration/ownership/check-in, protected screenshot uploads/review/persistence, staff codes, course signup and self profile updates, preserved legacy records, allowed payment methods, unlimited registrations, event covers and upload limits, private records, role guards, payment integrity, attendance, persistence, JSON parsing, static allowlist, and origin checks.');
+ }finally{if(server?.listening)await new Promise(r=>server.close(r));fs.rmSync(dataDir,{recursive:true,force:true});}
+})().catch(error=>{console.error(error);process.exitCode=1;});

@@ -1,0 +1,6 @@
+.browser-test/
+data/
+.env
+.env.*
+
+node_modules/
